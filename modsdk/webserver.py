@@ -3,12 +3,18 @@
 
 import json
 import os
+import sys
 import random
 import re
 import shutil
 import subprocess
 import pyinotify
+import asyncio
+import signal
 
+from threading  import Thread
+from queue import Queue
+from pydispatch import dispatcher
 from base64 import b64encode
 from PIL import Image
 from time import time
@@ -511,27 +517,35 @@ class Screenshot(JsonRequestHandler):
         tmp_filename = ''.join([ random.choice('0123456789abcdef') for i in range(6) ])
         return '/tmp/%s.png' % tmp_filename
 
+    def proc_callback(self, message):
+        fh = open(self.fname, 'rb')
+        os.remove(self.fname)
+        self.handle_image(fh)
+
+    def proc_watch(self,out, queue):
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        for line in iter(out.readline, b''):
+            queue.put(line)
+        out.close()
+        dispatcher.send(message='screenshoot is ready', signal=self.signal, sender=self.sender)
+        sys.exit()
+
     def make_screenshot(self):
-        fname = self.tmp_filename()
+        self.fname = self.tmp_filename()
+        self.sender = 'watcher'
+        self.signal = 'ready'
+        dispatcher.connect(self.proc_callback, signal=self.signal, sender=self.sender)
         proc = subprocess.Popen([ PHANTOM_BINARY,
                                   SCREENSHOT_SCRIPT,
                                   'http://localhost:%d/icon.html#%s' % (PORT, self.uri),
-                                  fname,
+                                  self.fname,
                                   self.width,
                                   self.height,
                                 ],
                                 stdout=subprocess.PIPE)
-
-        def proc_callback(fileno, event):
-            if proc.poll() is None:
-                return
-            loop.remove_handler(fileno)
-            fh = open(fname, 'rb')
-            os.remove(fname)
-            self.handle_image(fh)
-
-        loop = ioloop.IOLoop.instance()
-        loop.add_handler(proc.stdout.fileno(), proc_callback, 16)
+        self.q = Queue()
+        self.t = Thread(target=self.proc_watch, args=(proc.stdout, self.q))
+        self.t.start()
 
     def handle_image(self, fh):
         screenshot_path = self.data['gui']['screenshot']
@@ -786,10 +800,15 @@ def run():
     if not check_environment():
         return
 
+    signal.signal(signal.SIGINT, signal_handler)
     lv2_init()
     welcome_message()
     make_application().start()
     lv2_cleanup()
+
+def signal_handler(signal, frame):
+    print(' Thanks for using the MOD-SDK, bye bye.')
+    sys.exit(0)
 
 if __name__ == "__main__":
     run()
